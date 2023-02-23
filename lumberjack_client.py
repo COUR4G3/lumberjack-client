@@ -420,14 +420,18 @@ def _format_level(level):
 @click.argument("query", required=False)
 @click.option("-f", "--follow", is_flag=True)
 @click.option("--pager/--no-pager", default=True)
-@click.option("-t", "--tail", type=int)
+@click.option("-t", "--tail", type=click.IntRange(0, clamp=True))
 def tail(follow, query, pager, tail):
     def generator():
         with BaseUrlSession("http://localhost:5000/") as session:
             count = 0
+
             params = {}
             if query:
                 params["q"] = query
+            if tail:
+                params["limit"] = tail
+
             path = {"url": "api/v1/messages"}
             while path:
                 resp = session.get(path["url"], params=params)
