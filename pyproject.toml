@@ -65,6 +65,9 @@ target-version = ['py37']
 [tool.coverage.run]
 source = ["lumberjack_client"]
 
+[tool.distutils.build_exe]
+zip_include_packages = ["click"]
+
 [tool.pytest.ini_options]
 addopts = "--cov=lumberjack-client.py --cov-report html --cov-report term-missing"
 markers = [
