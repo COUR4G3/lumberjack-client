@@ -1,17 +1,17 @@
 import datetime as dt
 import json
 import logging
-import os
 import selectors
 import socket
 import ssl
-import sys
+import time
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 
 import click
 import requests
-from dateutil.parser import parse as parse_date
+import sslpsk
+from dtls import do_patch
 from requests_toolbelt.sessions import BaseUrlSession
 from requests_toolbelt.utils.user_agent import user_agent
 from syslog_rfc5424_parser import SyslogMessage, ParseError
@@ -29,6 +29,7 @@ except ImportError:
     except PackageNotFoundError:
         __version__ = "0.1-dev0"
 
+do_patch()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig()
@@ -53,11 +54,6 @@ def cli(ctx: click.Context):
 def _prepare_post_data(line, context=None):
     data = {"body": line}
 
-    try:
-        data["date"] = parse_date(line, fuzzy=True).isoformat()
-    except ValueError:
-        pass
-
     if context:
         data["context"] = context
 
@@ -69,8 +65,6 @@ def _prepare_post_data(line, context=None):
 def _ingest_file_to_api(path, context=None, encoding=None, server=None):
     if not context:
         context = {}
-    if not server:
-        server = "https://lumberjack.sh/"
 
     with BaseUrlSession(server) as session:
         session.headers.update(
@@ -132,6 +126,7 @@ class EventHandler(FileSystemEventHandler):
 @click.option(
     "-s",
     "--server",
+    default="https://lumberjack.sh/",
     envvar="JACK_SERVER",
     help="The server to send messages to.",
 )
@@ -158,6 +153,12 @@ def ingest(context, encoding, src, server):
 
 @cli.command()
 @click.option(
+    "-c",
+    "--context",
+    envvar="JACK_CONTEXT",
+    help="Context to include with logging messages.",
+)
+@click.option(
     "-h",
     "--host",
     default="",
@@ -174,6 +175,7 @@ def ingest(context, encoding, src, server):
 @click.option(
     "-s",
     "--server",
+    default="https://lumberjack.sh/",
     envvar="JACK_SERVER",
     help="The server to send messages to.",
 )
@@ -185,34 +187,50 @@ def ingest(context, encoding, src, server):
 )
 @click.option(
     "--tls-ca",
-    is_flag=True,
+    type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True
+    ),
     envvar="JACK_SYSLOG_TLS_CA",
-    help="TLS CA certificate to use for client certificate verification.",
+    help="Path to TLS CA certificate to use for client verification.",
 )
 @click.option(
     "--tls-certfile",
-    is_flag=True,
+    type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True
+    ),
     envvar="JACK_SYSLOG_TLS_CERTFILE",
-    help="TLS server certificate to use.",
+    help="Path to TLS server certificate to use.",
 )
 @click.option(
     "--tls-hostname",
-    is_flag=True,
     envvar="JACK_SYSLOG_TLS_HOSTNAME",
     help="Hostname to present for TLS certficate verification.",
 )
 @click.option(
     "--tls-keyfile",
-    is_flag=True,
+    type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True
+    ),
     envvar="JACK_SYSLOG_TLS_KEYFILE",
-    help="TLS server key to use.",
+    help="Path to TLS server key to use.",
 )
 @click.option(
-    "-u",
-    "--udp",
-    is_flag=True,
-    envvar="JACK_SYSLOG_UDP",
-    help="Use RFC 5426 UDP message transport.",
+    "--tls-psk",
+    envvar="JACK_SYSLOG_TLS_PSK",
+    help="TLS pre-shared key to use.",
+)
+@click.option(
+    "--tls-psk-file",
+    type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True
+    ),
+    envvar="JACK_SYSLOG_TLS_PSK_FILE",
+    help="Path to TLS pre-shared keys in 'identity:key' mapping to use.",
+)
+@click.option(
+    "--tls-psk-hint",
+    envvar="JACK_SYSLOG_TLS_PSK_HINT",
+    help="TLS pre-shared key hint to send client to help select the key.",
 )
 @click.option(
     "-v",
@@ -221,6 +239,7 @@ def ingest(context, encoding, src, server):
     help="Enable verbose logging output, repeat for more verbose output.",
 )
 def syslog(
+    context,
     host,
     port,
     server,
@@ -229,16 +248,20 @@ def syslog(
     tls_certfile,
     tls_hostname,
     tls_keyfile,
-    udp,
+    tls_psk,
+    tls_psk_file,
+    tls_psk_hint,
     verbose,
 ):
     """Forward syslog messages.
 
-    A simple forwarder that can handle RFC 3165 BSD, RFC 5424 TCP and RFC 5426
-    UDP messages, and also supports RFC 5425 TLS security.
+    A simple forwarder that handle RFC 5424 messages, from either TCP, TLS, UDP
+    or DTLS (RFCs 5424, 5425, 5426 and 6012 respectively).
 
-    If --tls is specified, you must also specify --certfile and --keyfile.
-    Also, --udp (RFC 6012, Syslog over DTLS) is not currently supported.
+    If --tls is specified, you must also specify a path for --tls-certfile and
+    --tls-keyfile - and optionally, --tls-ca if you are doing client
+    certificate authentication. Alternatively, --tls-psk or --tls-psk-file and
+    optionally --tls-psk-hint to use pre-shared keys and identities.
 
     """
     if verbose > 1:
@@ -251,50 +274,71 @@ def syslog(
     elif not port:
         port = 514
 
-    if udp and tls:
+    if tls and (not tls_certfile or not tls_keyfile) and not tls_psk:
         raise click.ClickException(
-            "RFC 6012, Syslog over DTLS is not currently supported. You "
-            "cannot combine --tls and --udp flags."
-        )
-    elif tls and (not tls_certfile or not tls_keyfile):
-        raise click.ClickException(
-            "--tls-certfile and --tls-keyfile required with --tls flag."
+            "--tls-certfile and --tls-keyfile, or --tls-psk required with "
+            "--tls flag."
         )
 
-    if udp:
-        sock_type = socket.SOCK_DGRAM
-    else:
-        sock_type = socket.SOCK_STREAM
+    tcp_sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    tcp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
-    sock = socket.socket(socket.AF_INET6, sock_type, 0)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    udp_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, 0)
+    udp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
     if tls:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        ssl_context.load_cert_chain(tls_certfile, tls_keyfile)
 
         if tls_ca:
             ssl_context.load_verify_locations(tls_ca)
             ssl_context.verify_mode = ssl.CERT_REQUIRED
             ssl_context.check_hostname = True
 
-        ssl_context.wrap_socket(
-            sock,
-            server_side=True,
-            do_handshake_on_connect=True,
+        if tls_certfile and tls_keyfile:
+            ssl_context.load_cert_chain(tls_certfile, tls_keyfile)
+
+        if tls_psk_file:
+            tls_psk = {}
+            with open(tls_psk, "rb") as f:
+                for line in f:
+                    identity, key = line.split(b":")
+                    key = key.strip()
+                    tls_psk[identity] = key
+
+        tcp_sock = ssl_context.wrap_socket(
+            tcp_sock,
+            server_side=not tls_psk,
             server_hostname=tls_hostname,
         )
+
+        udp_sock = ssl_context.wrap_socket(
+            udp_sock,
+            server_side=not tls_psk,
+            server_hostname=tls_hostname,
+        )
+
+        if tls_psk:
+
+            def cb(identity):
+                if tls_psk_file:
+                    return tls_psk.get(identity)
+                else:
+                    return tls_psk
+
+            sslpsk._ssl_set_psk_server_callback(tcp_sock, cb, tls_psk_hint)
+            sslpsk._ssl_set_psk_server_callback(udp_sock, cb, tls_psk_hint)
 
     selector = selectors.DefaultSelector()
 
     with BaseUrlSession(server) as session:
 
-        def _syslog_handle(data, context=None):
-            if not context:
-                context = {}
+        def _syslog_data_handle(data, additional_context=None):
+            if not additional_context:
+                additional_context = {}
 
             message = SyslogMessage.parse(data.decode("utf-8"))
 
@@ -318,6 +362,7 @@ def syslog(
             data["context"].update(
                 {"jack-ingest-from": f"syslog:{host}:{port}"}
             )
+            data["context"].update(additional_context)
             data["context"].update(context)
 
             while True:
@@ -330,45 +375,85 @@ def syslog(
                 except requests.exceptions.RequestException:
                     continue
 
-        def _syslog_tcp_accept(sock):
+        def _syslog_accept(sock):
             conn, addr = sock.accept()
-            selector.register(conn, selectors.EVENT_READ, _syslog_tcp_handle)
-            logger.info("Accepted connection from %s", addr)
+            selector.register(conn, selectors.EVENT_READ, _syslog_sock_handle)
 
-        def _syslog_tcp_handle(sock):
+            if sock.type == socket.SOCK_DGRAM:
+                sock_type = "dtls"
+            elif tls:
+                sock_type = "tls"
+            else:
+                sock_type = "tcp"
+
+            logger.info(
+                "Accepted connection from [%s]:%s:%d", sock_type, *addr
+            )
+
+        def _syslog_sock_handle(sock):
             addr = sock.getpeername()
+
+            if sock.type == socket.SOCK_DGRAM:
+                sock_type = "dtls"
+            elif tls:
+                sock_type = "tls"
+            else:
+                sock_type = "tcp"
 
             try:
                 data = sock.recv(4096)
             except socket.error as e:
                 logger.exception(
-                    "Client %s disconnected [%d]: %s",
-                    addr,
+                    "Client [%s]:%s:%d disconnected [%d]: %s",
+                    sock_type,
+                    *addr,
                     e.errno,
                     e.strerror,
                 )
 
             if not data:
                 selector.unregister(sock)
-                logger.info("Client %s disconnected", addr)
+                logger.info("Client [%s]:%s:%d disconnected", sock_type, *addr)
+                sock.close()
+                return
 
-            logger.debug("Received %d bytes from from tcp:%s", len(data), addr)
+            logger.debug(
+                "Received %d bytes from from [%s]:%s:%s",
+                len(data),
+                sock_type,
+                *addr,
+            )
             logger.debug("Data: %s", data.decode("utf-8", "replace"))
 
-            _syslog_handle(data, {"syslog_client": addr[0]})
+            _syslog_data_handle(
+                data, {"syslog-client": f"[{sock_type}]:{addr[0]}:{addr[1]}"}
+            )
 
         def _syslog_udp_handle(sock):
             data, addr = sock.recvfrom(4096)
 
-            logger.debug("Received %d bytes from from udp:%s", len(data), addr)
+            logger.debug(
+                "Received %d bytes from from [udp]:%s:%d", len(data), *addr
+            )
             logger.debug("Data: %s", data.decode("utf-8", "replace"))
 
-            _syslog_handle(data, {"syslog_client": addr[0]})
+            _syslog_data_handle(
+                data, {"syslog-client": f"[udp]:{addr[0]}:{addr[1]}"}
+            )
 
-        if udp:
-            selector.register(sock, selectors.EVENT_READ, _syslog_udp_handle)
+        tcp_sock.bind((host, port))
+        tcp_sock.listen(4)
+
+        selector.register(tcp_sock, selectors.EVENT_READ, _syslog_accept)
+
+        udp_sock.bind((host, port))
+        if tls:
+            udp_sock.listen(4)
+            selector.register(udp_sock, selectors.EVENT_READ, _syslog_accept)
         else:
-            selector.register(sock, selectors.EVENT_READ, _syslog_tcp_accept)
+            selector.register(
+                udp_sock, selectors.EVENT_READ, _syslog_udp_handle
+            )
 
         session.headers.update(
             {
@@ -376,17 +461,20 @@ def syslog(
             }
         )
 
-        sock.bind((host, port))
-
-        if not udp:
-            sock.listen(128)
-
-        logger.info(
-            "Listening for connections on %s:%s:%d ...",
-            "udp" if udp else "tcp",
-            host,
-            port,
-        )
+        if tls:
+            logger.info(
+                "Listening for connections on [dtls]:%s:%d ...", host, port
+            )
+            logger.info(
+                "Listening for connections on [tls]:%s:%d ...", host, port
+            )
+        else:
+            logger.info(
+                "Listening for connections on [tcp]:%s:%d ...", host, port
+            )
+            logger.info(
+                "Listening for connections on [udp]:%s:%d ...", host, port
+            )
 
         try:
             while True:
@@ -397,7 +485,8 @@ def syslog(
         except (KeyboardInterrupt, SystemExit):
             logger.info("Shutting down ...")
         finally:
-            sock.close()
+            tcp_sock.close()
+            udp_sock.close()
             selector.close()
 
 
@@ -420,36 +509,56 @@ def _format_level(level):
 @click.argument("query", required=False)
 @click.option("-f", "--follow", is_flag=True)
 @click.option("--pager/--no-pager", default=True)
+@click.option(
+    "-s",
+    "--server",
+    default="https://lumberjack.sh/",
+    envvar="JACK_SERVER",
+    help="The server to send messages to.",
+)
 @click.option("-t", "--tail", type=click.IntRange(0, clamp=True))
-def tail(follow, query, pager, tail):
+def tail(follow, query, pager, server, tail):
     def generator():
-        with BaseUrlSession("http://localhost:5000/") as session:
-            count = 0
+        nonlocal tail
 
-            params = {}
-            if query:
-                params["q"] = query
+        with BaseUrlSession(server) as session:
             if tail:
-                params["limit"] = tail
+                tail_messages = []
 
-            path = {"url": "api/v1/messages"}
-            while path:
-                resp = session.get(path["url"], params=params)
-                resp.raise_for_status()
+                params = {"limit": min(tail, 1024), "order": "-date"}
+                path = "api/v1/messages"
+                while tail > 0:
+                    resp = session.get(path, params=params)
+                    resp.raise_for_status()
 
-                data = resp.json()
-                if not data:
-                    return
+                    messages = resp.json()
+                    if not messages:
+                        break
+                    tail -= len(messages)
 
-                for line in data:
-                    date = dt.datetime.fromisoformat(line["date"])
-                    level = _format_level("emerg")
-                    yield f"{date.strftime('%c')} {level} {line['body'].rstrip()} {line['context']}\n"
-                    count += 1
+                    tail_messages += messages
 
-                path = resp.links.get("next")
+                    path = resp.links["prev"]["url"]
 
-        yield f"({count} records)"
+                for message in reversed(tail_messages):
+                    _print_message(message)
+            else:
+                params = {}
+                path = "api/v1/messages"
+                while True:
+                    resp = session.get(path, params=params)
+                    resp.raise_for_status()
+
+                    if not messages and follow:
+                        time.sleep(1.0)
+                        continue
+                    elif not messages:
+                        break
+
+                    for message in resp.json():
+                        _print_message(message)
+
+                    path = resp.links["next"]["url"]
 
     if pager:
         click.echo_via_pager(generator())
@@ -464,3 +573,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _print_message(message):
+    pass
